@@ -1,0 +1,25 @@
+# Files and directories to exclude from Claude Code access
+# Syntax is similar to .gitignore
+
+# Configuration files with sensitive data
+config.yaml
+*.env
+.env*
+
+# Secret files
+secrets/
+*.key
+*.pem
+
+# Database files
+*.db
+*.sqlite
+
+# Log files
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+.chroma_store
