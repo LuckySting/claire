@@ -4,10 +4,12 @@ from typing import TYPE_CHECKING
 from typing import Literal
 
 import gitlab
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
 from langchain_core.messages import SystemMessage
+from langchain_core.prompts import HumanMessagePromptTemplate
+from langchain_core.prompts import SystemMessagePromptTemplate
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
@@ -245,6 +247,10 @@ class Claire:
         ]
         self._gitlab.add_merge_request_comment(merge_request_id, "\n".join(comment))
 
+    def add_knowledge(self, text: str) -> None:
+        documents = [Document(page_content=text)]
+        self._memory.add_documents(documents)
+
     def index_merge_request_discussions(self, merge_request_id: int, ignore_authors: set[str]) -> None:
         threads = self._gitlab.list_merge_request_threads(merge_request_id, ignore_authors)
         prompt_template = """When we change {related_file} on line {related_line} with diff
@@ -273,35 +279,55 @@ class Claire:
         self._memory.add_documents(documents)
 
     def ask(self, question: str) -> str:
-        system_prompt = SystemMessage(
+        # TODO(tretiak-rd): Query documents with it using metadata
+        # TODO(tretiak-rd): Generalize logic and extract to method for reuse in diff analyze task
+
+        query_prompt_template = SystemMessagePromptTemplate.from_template(
             "You are a project wisdom keeper, your memory is vector storage. You need to answer the question retrieving"
-            "information from it using queries."
+            "information from it using queries.\n"
+            'Question "{question}"\n'
             "Generate a search query for the vector storage to answer the question"
-            ", you will get documents by your query."
-            "Respond with either QUERY response if you need to search something or ANSWER if you are ready to answer. "
-            "No more than 400 characters in ANSWER. "
-            "No more than 80 characters in QUERY. "
-            "Respond with JSON in this exact format: "
-            "in case of QUERY:"
-            '{"query": "Brief query for the vector storage"}'
-            "or in case of ANSWER:"
-            '{"answer": "Comprehensive answer"}'
+            ", you will get documents by your query.\n"
+            "You must include to your query the name of service and the name of file if it is mentioned in question.\n"
+            "First query should be general, next query less general and so on.\n"
+            "Your queries must be different, no duplicate queries.\n"
+            "No more than 100 characters in query.\n"
+            "Respond with JSON in this exact format:\n"
+            "{format}\n",
+            partial_variables={"format": '{"query": "Query for the vector storage", "ready_to_answer": true/false}'},
         )
-        human_prompt = HumanMessage(f"Question: {question}")
+        answer_prompt_template = SystemMessagePromptTemplate.from_template(
+            "You are a project wisdom keeper you need to answer the question based on these documents:\n"
+            "{context}\n"
+            'The question: "{question}"\n'
+            "No more than 400 characters in answer.\n"
+            "Respond with JSON in this exact format:\n"
+            "{format}\n",
+            partial_variables={"format": '{"answer": "Comprehensive answer"}'},
+        )
+        human_prompt_template = HumanMessagePromptTemplate.from_template("Documents: {context}")
 
-        all_documents: list[Document] = []
-        for _ in range(3):
-            response = self._model.invoke([system_prompt, human_prompt]).content
-            response_data = json.loads(response.removeprefix("```json\n").removesuffix("```"))
-            if "query" in response_data:
-                docs = self._retriever.invoke(response_data["query"])
-                all_documents.extend(docs)
-                context = "\n\n".join([doc.page_content for doc in docs])
-                human_prompt = HumanMessage(f"Question: {question}\n\nDocuments: {context}")
-            elif "answer" in response_data:
-                return response_data["answer"]
+        context = ""
+        retrieved_documents_ids = set()
+        for _ in range(5):
+            response = self._model.invoke(
+                [query_prompt_template.format(question=question), human_prompt_template.format(context=context)]
+            ).content
+            try:
+                response_data = json.loads(response.removeprefix("```json\n").removesuffix("```"))
+            except json.decoder.JSONDecodeError:
+                LOG.exception("Could not decode JSON response: %s", response)
+                raise
+            LOG.warning("Querying the vector storage: %s", response_data["query"])
 
-        response = self._model.invoke([system_prompt, human_prompt, HumanMessage("You MUST answer now!")]).content
+            docs = self._retriever.invoke(response_data["query"])
+
+            context += "\n\n" + "\n\n".join([doc.page_content for doc in docs if doc.id not in retrieved_documents_ids])
+
+            if response_data.get("ready_to_answer", False):
+                break
+
+        response = self._model.invoke([answer_prompt_template.format(context=context, question=question)]).content
         response_data = json.loads(response.removeprefix("```json\n").removesuffix("```"))
         return response_data["answer"]
 

@@ -21,9 +21,7 @@ def main() -> None:
     settings = load_config()
     claire = Claire(settings)
 
-    claire.summarize_merge_request(38105)
-    claire.summarize_merge_request(37397)
-    claire.summarize_merge_request(36897)
+    claire.summarize_merge_request(38668)
 
 
 if __name__ == "__main__":
